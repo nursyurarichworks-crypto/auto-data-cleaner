@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pandas
+gspread
+google-auth
+google-api-python-client
+jinja2
+python-multipart
