@@ -1,12 +1,12 @@
 from fastapi import FastAPI, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
-import gspread
-from google.oauth2.service_account import Credentials
-from datetime import datetime
 import pandas as pd
 import os
+import json
+from datetime import datetime
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ----------------------------
 # FastAPI setup
@@ -22,21 +22,13 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-creds = Credentials.from_service_account_file(
-    "service_account.json",
-    scopes=SCOPES
-)
+# Load service account credentials from environment variable
+service_account_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT"])
+creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 gc = gspread.authorize(creds)
 
 CONTROL_SHEET_ID = "1lKAvIcCLBtwv5zKnCwdqP0xgBpUCjEeTewSwLuglDNU"
-
-EXCLUSION_TABS = [
-    "Active Titan/SPIRE",
-    "Ex-Membership",
-    "BGC",
-    "New Intake"
-]
-
+EXCLUSION_TABS = ["Active Titan/SPIRE", "Ex-Membership", "BGC", "New Intake"]
 SHARED_FOLDER_ID = "1YSwdmvSzfcqTCY3Ud10qmOG9ycRbThDE"
 MASTER_SHEET_ID = "1bnlemWPBoZ6wLXJlWEMPS8adB5GrnL9IX-3Zwvkl6Js"
 
@@ -59,14 +51,12 @@ def format_phone(v, cc):
 def build_exclusion_sets():
     exclude_ic, exclude_email, exclude_phone = set(), set(), set()
     sh = gc.open_by_key(CONTROL_SHEET_ID)
-
     for tab in EXCLUSION_TABS:
         try:
             ws = sh.worksheet(tab)
             rows = ws.get_all_values()
         except Exception:
             continue
-
         for row in rows:
             for cell in row:
                 if not cell:
@@ -79,21 +69,17 @@ def build_exclusion_sets():
                     if len(digits) >= 6:
                         exclude_ic.add(digits)
                         exclude_phone.add(digits)
-
     return exclude_ic, exclude_email, exclude_phone
-
 
 def get_or_create_ws(sh, title, rows=1000, cols=20):
     try:
-       return sh.worksheet(title)
+        return sh.worksheet(title)
     except:
-       return sh.add_worksheet(title=title, rows=rows, cols=cols)
-
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 # ----------------------------
 # UI
 # ----------------------------
-
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
@@ -103,7 +89,7 @@ def ui(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 # ----------------------------
-# Download route (optional)
+# Download route
 # ----------------------------
 @app.get("/download/{filename}")
 def download_file(filename: str):
@@ -112,6 +98,9 @@ def download_file(filename: str):
         return FileResponse(path, filename=filename)
     return {"status": "ERROR", "message": "File not found"}
 
+# ----------------------------
+# Clean route
+# ----------------------------
 @app.post("/clean")
 def clean_form(
     file: UploadFile = File(...),
@@ -181,104 +170,9 @@ def clean_form(
     if phone_col and phone_col in cleaned_df.columns:
         cleaned_df[phone_col] = cleaned_df[phone_col].apply(lambda x: format_phone(x, country_code))
 
-    # --- Utilities for clean matching ---
-    def clean_str(s):
-        return str(s or "").replace("\u00A0", " ").strip().lower()
-
-    sh_control = gc.open_by_key(CONTROL_SHEET_ID)
-
-    # --- Load control lists ---
-    def load_control_list(sheet_name, col_ranges=None):
-        try:
-            ws = sh_control.worksheet(sheet_name)
-            rows = ws.get_all_values()
-            lst = []
-            for r_idx, row in enumerate(rows):
-                for c_idx, cell in enumerate(row):
-                    if cell:
-                        cell_val = clean_str(cell)
-                        if col_ranges:
-                            if r_idx in col_ranges.get('rows', range(len(rows))) and \
-                               c_idx in col_ranges.get('cols', range(len(row))):
-                                lst.append(cell_val)
-                        else:
-                            lst.append(cell_val)
-            return lst
-        except Exception:
-            return []
-
-    titan_list = load_control_list("Active Titan/SPIRE", {"rows": range(0,5), "cols": range(0,5)})
-    spire_list = load_control_list("Active Titan/SPIRE", {"rows": range(7,12), "cols": range(7,12)})
-    new_intake_list = load_control_list("New Intake")
-    bgc_list = load_control_list("BGC")
-    exmem_list = load_control_list("Ex-Membership")
-
-    # --- Tagging functions ---
-    def tag_titan_spire(value):
-        if pd.isna(value):
-            return ""
-        s = clean_str(value)
-        if s in titan_list:
-            return "Active Titan"
-        elif s in spire_list:
-            return "Active SPIRE"
-        return ""
-
-    def tag_lookup(value, lookup_list, tag_name):
-        if pd.isna(value):
-            return ""
-        return tag_name if clean_str(value) in lookup_list else ""
-
-    # --- Apply tagging row-wise ---
-    tag_columns = ["Active Titan/SPIRE", "New Intake", "BGC", "Ex-Membership"]
-    for col in tag_columns:
-        excluded_df[col] = ""  # initialize
-
-    def tag_row(row):
-        for col_name in tag_columns:
-            tag = ""
-            # Check IC
-            if ic_col and pd.notna(row[ic_col]):
-                if col_name == "Active Titan/SPIRE":
-                    tag = tag_titan_spire(row[ic_col])
-                elif col_name == "New Intake":
-                    tag = tag_lookup(row[ic_col], new_intake_list, "Closing")
-                elif col_name == "BGC":
-                    tag = tag_lookup(row[ic_col], bgc_list, "BGC")
-                elif col_name == "Ex-Membership":
-                    tag = tag_lookup(row[ic_col], exmem_list, "Ex-Membership")
-
-            # If no tag, check Email
-            if not tag and email_col and pd.notna(row[email_col]):
-                if col_name == "Active Titan/SPIRE":
-                    tag = tag_titan_spire(row[email_col])
-                elif col_name == "New Intake":
-                    tag = tag_lookup(row[email_col], new_intake_list, "Closing")
-                elif col_name == "BGC":
-                    tag = tag_lookup(row[email_col], bgc_list, "BGC")
-                elif col_name == "Ex-Membership":
-                    tag = tag_lookup(row[email_col], exmem_list, "Ex-Membership")
-
-            # If no tag, check Phone
-            if not tag and phone_col and pd.notna(row[phone_col]):
-                if col_name == "Active Titan/SPIRE":
-                    tag = tag_titan_spire(row[phone_col])
-                elif col_name == "New Intake":
-                    tag = tag_lookup(row[phone_col], new_intake_list, "Closing")
-                elif col_name == "BGC":
-                    tag = tag_lookup(row[phone_col], bgc_list, "BGC")
-                elif col_name == "Ex-Membership":
-                    tag = tag_lookup(row[phone_col], exmem_list, "Ex-Membership")
-            row[col_name] = tag
-        return row
-
-    excluded_df = excluded_df.apply(tag_row, axis=1)
-
-    # --- Handle NaN for JSON & Google Sheets ---
+    # --- Cleanup ---
     cleaned_df = cleaned_df.where(pd.notnull(cleaned_df), None)
     excluded_df = excluded_df.where(pd.notnull(excluded_df), None)
-
-    # --- Cleanup ---
     cleaned_df.drop(columns=["IC_norm", "Email_norm", "Phone_norm", "FinalStatus"], errors="ignore", inplace=True)
     excluded_df.drop(columns=["IC_norm", "Email_norm", "Phone_norm"], errors="ignore", inplace=True)
 
@@ -307,7 +201,10 @@ def clean_form(
         "sheet_url": sheet_url
     }
 
-    if __name__ == "__main__":
-       import uvicorn
-       port = int(os.environ.get("PORT", 8000))
-       uvicorn.run("main:app", host="0.0.0.0", port=port)
+# ----------------------------
+# Run locally (optional)
+# ----------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
