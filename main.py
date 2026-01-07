@@ -28,6 +28,7 @@ gc = gspread.authorize(creds)
 
 CONTROL_SHEET_ID = "1lKAvIcCLBtwv5zKnCwdqP0xgBpUCjEeTewSwLuglDNU"
 EXCLUSION_TABS = ["Active Titan/SPIRE", "Ex-Membership", "BGC", "New Intake"]
+SHARED_FOLDER_ID = "1YSwdmvSzfcqTCY3Ud10qmOG9ycRbThDE"
 MASTER_SHEET_ID = "1bnlemWPBoZ6wLXJlWEMPS8adB5GrnL9IX-3Zwvkl6Js"
 
 # ----------------------------
@@ -46,15 +47,12 @@ def format_phone(v, cc):
     d = normalize_phone(v)
     return cc + d if d and not d.startswith(cc) else d
 
-# ----------------------------
-# Build exclusion sets safely
-# ----------------------------
+# 🔽 UPDATED: track IC source tab
 def build_exclusion_sets():
     exclude_ic, exclude_email, exclude_phone = set(), set(), set()
     ic_source = {}
 
     sh = gc.open_by_key(CONTROL_SHEET_ID)
-
     for tab in EXCLUSION_TABS:
         try:
             ws = sh.worksheet(tab)
@@ -63,44 +61,29 @@ def build_exclusion_sets():
             continue
 
         for row in rows:
-            for idx, cell in enumerate(row):
-                if not cell or str(cell).strip() == "":
+            for cell in row:
+                if not cell:
                     continue
-
-                val = str(cell).strip()
-
-                # Email
-                if "@" in val:
-                    exclude_email.add(val.lower())
-                    continue
-
-                # IC / Phone
-                digits = normalize_ic(val)
-                if len(digits) < 6:
-                    continue
-
-                exclude_ic.add(digits)
-                exclude_phone.add(digits)
-
-                # Map IC source safely
-                if tab == "Active Titan/SPIRE":
-                    if idx == 2:        # Column C -> Active Titan
-                        ic_source[digits] = "Active Titan"
-                    elif idx == 9:      # Column J -> Active SPIRE
-                        ic_source[digits] = "Active SPIRE"
+                s = str(cell).strip()
+                if "@" in s:
+                    exclude_email.add(s.lower())
                 else:
-                    ic_source[digits] = tab
+                    digits = normalize_ic(s)
+                    if len(digits) >= 6:
+                        exclude_ic.add(digits)
+                        exclude_phone.add(digits)
+                        ic_source[digits] = tab
 
     return exclude_ic, exclude_email, exclude_phone, ic_source
 
 def get_or_create_ws(sh, title, rows=1000, cols=20):
     try:
         return sh.worksheet(title)
-    except gspread.WorksheetNotFound:
+    except:
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 # ----------------------------
-# UI Routes
+# UI
 # ----------------------------
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
@@ -111,7 +94,7 @@ def ui(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 # ----------------------------
-# Download Route
+# Download route
 # ----------------------------
 @app.get("/download/{filename}")
 def download_file(filename: str):
@@ -121,7 +104,7 @@ def download_file(filename: str):
     return {"status": "ERROR", "message": "File not found"}
 
 # ----------------------------
-# Clean Route
+# Clean route
 # ----------------------------
 @app.post("/clean")
 def clean_form(
@@ -129,13 +112,14 @@ def clean_form(
     sheet_name: str = Form(None),
     country_code: str = Form("60")
 ):
-    # Load Excel
     try:
-        df = pd.read_excel(file.file, sheet_name=sheet_name) if sheet_name else pd.read_excel(file.file)
+        if sheet_name:
+            df = pd.read_excel(file.file, sheet_name=sheet_name)
+        else:
+            df = pd.read_excel(file.file)
     except Exception as e:
         return {"status": "ERROR", "message": f"Failed to read Excel: {e}"}
 
-    # Columns to detect
     ic_cols = ["IC", "ICNumber", "IC Number", "Identification Number"]
     email_cols = ["Email", "EmailAddress", "E-mail"]
     phone_cols = ["Mobile", "Phone", "PhoneNumber"]
@@ -153,13 +137,11 @@ def clean_form(
     if not any([ic_col, email_col, phone_col]):
         return {"status": "ERROR", "message": "No IC, Email, or Phone column found"}
 
-    # Build exclusion sets
     try:
         exclude_ic, exclude_email, exclude_phone, ic_source = build_exclusion_sets()
     except Exception as e:
         return {"status": "ERROR", "message": f"Failed to access control sheet: {e}"}
 
-    # Normalize columns
     if ic_col:
         df["IC_norm"] = df[ic_col].apply(normalize_ic)
     if email_col:
@@ -170,57 +152,53 @@ def clean_form(
     df["FinalStatus"] = ""
     mask_ok = df["FinalStatus"] == ""
 
-    # Apply exclusions
     if ic_col:
         df.loc[df["IC_norm"].isin(exclude_ic), "FinalStatus"] = "Excluded - Control List"
-        df.loc[mask_ok & df.duplicated("IC_norm"), "FinalStatus"] = "Excluded - Duplicate IC"
+        df.loc[mask_ok & df.duplicated("IC_norm"), "FinalStatus"] = "Excluded – Duplicate IC"
     if email_col:
         df.loc[df["Email_norm"].isin(exclude_email), "FinalStatus"] = "Excluded - Control List"
-        df.loc[mask_ok & df.duplicated("Email_norm"), "FinalStatus"] = "Excluded - Duplicate Email"
+        df.loc[mask_ok & df.duplicated("Email_norm"), "FinalStatus"] = "Excluded – Duplicate Email"
     if phone_col:
         df.loc[df["Phone_norm"].isin(exclude_phone), "FinalStatus"] = "Excluded - Control List"
-        df.loc[mask_ok & df.duplicated("Phone_norm"), "FinalStatus"] = "Excluded - Duplicate Phone"
+        df.loc[mask_ok & df.duplicated("Phone_norm"), "FinalStatus"] = "Excluded – Duplicate Phone"
 
-    # Split cleaned and excluded
     cleaned_df = df[df["FinalStatus"] == ""].copy()
     excluded_df = df[df["FinalStatus"] != ""].copy()
 
-    # Format phone in cleaned
     if phone_col and phone_col in cleaned_df.columns:
         cleaned_df[phone_col] = cleaned_df[phone_col].apply(lambda x: format_phone(x, country_code))
 
-    # Add exclusion tags safely
-    for col in ["Active Membership", "BGC", "New Intake", "Ex Membership"]:
-        excluded_df[col] = ""
+    # 🔽 ADD 4 EXCLUSION TAG COLUMNS
+    excluded_df["Active Membership"] = ""
+    excluded_df["BGC"] = ""
+    excluded_df["New Intake"] = ""
+    excluded_df["Ex Membership"] = ""
 
     if ic_col:
         for idx, row in excluded_df.iterrows():
             ic = row.get("IC_norm")
-            if pd.isna(ic) or ic == "":
-                continue
-            src = ic_source.get(ic)
-            if not src:
-                continue
+            source = ic_source.get(ic)
 
-            if src == "Active Titan":
-                excluded_df.at[idx, "Active Membership"] = "Active Titan"
-            elif src == "Active SPIRE":
-                excluded_df.at[idx, "Active Membership"] = "Active SPIRE"
-            elif src == "BGC":
+            if source == "Active Titan/SPIRE":
+                excluded_df.at[idx, "Active Membership"] = "Active SPIRE / Active Titan"
+            elif source == "BGC":
                 excluded_df.at[idx, "BGC"] = "BGC"
-            elif src == "New Intake":
+            elif source == "New Intake":
                 excluded_df.at[idx, "New Intake"] = "Closing"
-            elif src == "Ex-Membership":
+            elif source == "Ex-Membership":
                 excluded_df.at[idx, "Ex Membership"] = "Ex Membership"
 
-    # Drop temporary columns
+    cleaned_df = cleaned_df.where(pd.notnull(cleaned_df), None)
+    excluded_df = excluded_df.where(pd.notnull(excluded_df), None)
+
     cleaned_df.drop(columns=["IC_norm", "Email_norm", "Phone_norm", "FinalStatus"], errors="ignore", inplace=True)
     excluded_df.drop(columns=["IC_norm", "Email_norm", "Phone_norm"], errors="ignore", inplace=True)
 
-    # Upload to master sheet
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     sh_master = gc.open_by_key(MASTER_SHEET_ID)
-    ws_cleaned = get_or_create_ws(sh_master, "Cleaned", rows=len(cleaned_df)+1)
-    ws_excluded = get_or_create_ws(sh_master, "Excluded", rows=len(excluded_df)+1)
+
+    ws_cleaned = get_or_create_ws(sh_master, "Cleaned", rows=len(cleaned_df) + 1)
+    ws_excluded = get_or_create_ws(sh_master, "Excluded", rows=len(excluded_df) + 1)
 
     ws_cleaned.clear()
     ws_excluded.clear()
