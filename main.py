@@ -22,7 +22,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-# Load service account credentials from environment variable
 service_account_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT"])
 creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 gc = gspread.authorize(creds)
@@ -48,8 +47,11 @@ def format_phone(v, cc):
     d = normalize_phone(v)
     return cc + d if d and not d.startswith(cc) else d
 
+# 🔽 UPDATED: track IC source tab
 def build_exclusion_sets():
     exclude_ic, exclude_email, exclude_phone = set(), set(), set()
+    ic_source = {}
+
     sh = gc.open_by_key(CONTROL_SHEET_ID)
     for tab in EXCLUSION_TABS:
         try:
@@ -57,6 +59,7 @@ def build_exclusion_sets():
             rows = ws.get_all_values()
         except Exception:
             continue
+
         for row in rows:
             for cell in row:
                 if not cell:
@@ -69,7 +72,9 @@ def build_exclusion_sets():
                     if len(digits) >= 6:
                         exclude_ic.add(digits)
                         exclude_phone.add(digits)
-    return exclude_ic, exclude_email, exclude_phone
+                        ic_source[digits] = tab
+
+    return exclude_ic, exclude_email, exclude_phone, ic_source
 
 def get_or_create_ws(sh, title, rows=1000, cols=20):
     try:
@@ -107,7 +112,6 @@ def clean_form(
     sheet_name: str = Form(None),
     country_code: str = Form("60")
 ):
-    # --- Load Excel ---
     try:
         if sheet_name:
             df = pd.read_excel(file.file, sheet_name=sheet_name)
@@ -116,7 +120,6 @@ def clean_form(
     except Exception as e:
         return {"status": "ERROR", "message": f"Failed to read Excel: {e}"}
 
-    # --- Column detection ---
     ic_cols = ["IC", "ICNumber", "IC Number", "Identification Number"]
     email_cols = ["Email", "EmailAddress", "E-mail"]
     phone_cols = ["Mobile", "Phone", "PhoneNumber"]
@@ -134,13 +137,11 @@ def clean_form(
     if not any([ic_col, email_col, phone_col]):
         return {"status": "ERROR", "message": "No IC, Email, or Phone column found"}
 
-    # --- Build exclusion sets ---
     try:
-        exclude_ic, exclude_email, exclude_phone = build_exclusion_sets()
+        exclude_ic, exclude_email, exclude_phone, ic_source = build_exclusion_sets()
     except Exception as e:
         return {"status": "ERROR", "message": f"Failed to access control sheet: {e}"}
 
-    # --- Normalize input ---
     if ic_col:
         df["IC_norm"] = df[ic_col].apply(normalize_ic)
     if email_col:
@@ -148,7 +149,6 @@ def clean_form(
     if phone_col:
         df["Phone_norm"] = df[phone_col].apply(normalize_phone)
 
-    # --- Duplicates & Exclusions ---
     df["FinalStatus"] = ""
     mask_ok = df["FinalStatus"] == ""
 
@@ -162,34 +162,49 @@ def clean_form(
         df.loc[df["Phone_norm"].isin(exclude_phone), "FinalStatus"] = "Excluded - Control List"
         df.loc[mask_ok & df.duplicated("Phone_norm"), "FinalStatus"] = "Excluded – Duplicate Phone"
 
-    # --- Split cleaned / excluded ---
     cleaned_df = df[df["FinalStatus"] == ""].copy()
     excluded_df = df[df["FinalStatus"] != ""].copy()
 
-    # --- Format phone ---
     if phone_col and phone_col in cleaned_df.columns:
         cleaned_df[phone_col] = cleaned_df[phone_col].apply(lambda x: format_phone(x, country_code))
 
-    # --- Cleanup ---
+    # 🔽 ADD 4 EXCLUSION TAG COLUMNS
+    excluded_df["Active Membership"] = ""
+    excluded_df["BGC"] = ""
+    excluded_df["New Intake"] = ""
+    excluded_df["Ex Membership"] = ""
+
+    if ic_col:
+        for idx, row in excluded_df.iterrows():
+            ic = row.get("IC_norm")
+            source = ic_source.get(ic)
+
+            if source == "Active Titan/SPIRE":
+                excluded_df.at[idx, "Active Membership"] = "Active SPIRE / Active Titan"
+            elif source == "BGC":
+                excluded_df.at[idx, "BGC"] = "BGC"
+            elif source == "New Intake":
+                excluded_df.at[idx, "New Intake"] = "Closing"
+            elif source == "Ex-Membership":
+                excluded_df.at[idx, "Ex Membership"] = "Ex Membership"
+
     cleaned_df = cleaned_df.where(pd.notnull(cleaned_df), None)
     excluded_df = excluded_df.where(pd.notnull(excluded_df), None)
+
     cleaned_df.drop(columns=["IC_norm", "Email_norm", "Phone_norm", "FinalStatus"], errors="ignore", inplace=True)
     excluded_df.drop(columns=["IC_norm", "Email_norm", "Phone_norm"], errors="ignore", inplace=True)
 
-    # --- Create Google Sheet ---
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     sh_master = gc.open_by_key(MASTER_SHEET_ID)
 
-    ws_cleaned = get_or_create_ws(sh_master, "Cleaned", rows=len(cleaned_df)+1)
-    ws_excluded = get_or_create_ws(sh_master, "Excluded", rows=len(excluded_df)+1)
+    ws_cleaned = get_or_create_ws(sh_master, "Cleaned", rows=len(cleaned_df) + 1)
+    ws_excluded = get_or_create_ws(sh_master, "Excluded", rows=len(excluded_df) + 1)
 
     ws_cleaned.clear()
     ws_excluded.clear()
 
     ws_cleaned.update([cleaned_df.columns.tolist()] + cleaned_df.values.tolist())
     ws_excluded.update([excluded_df.columns.tolist()] + excluded_df.values.tolist())
-
-    sheet_url = sh_master.url
 
     return {
         "status": "OK",
@@ -198,11 +213,11 @@ def clean_form(
             "totalCleaned": len(cleaned_df),
             "totalExcluded": len(excluded_df)
         },
-        "sheet_url": sheet_url
+        "sheet_url": sh_master.url
     }
 
 # ----------------------------
-# Run locally (optional)
+# Run locally
 # ----------------------------
 if __name__ == "__main__":
     import uvicorn
