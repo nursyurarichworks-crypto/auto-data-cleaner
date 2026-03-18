@@ -22,7 +22,11 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-service_account_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT"])
+if "GOOGLE_SERVICE_ACCOUNT" in os.environ:
+    service_account_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT"])
+else:
+    service_account_info = json.load(open("service_account_one.json"))
+
 creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 gc = gspread.authorize(creds)
 
