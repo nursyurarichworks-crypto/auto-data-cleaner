@@ -192,8 +192,8 @@ def clean_form(
             elif source == "Ex-Membership":
                 excluded_df.at[idx, "Ex Membership"] = "Ex Membership"
 
-    cleaned_df = cleaned_df.where(pd.notnull(cleaned_df), None)
-    excluded_df = excluded_df.where(pd.notnull(excluded_df), None)
+    cleaned_df = cleaned_df.replace([np.nan, np.inf, -np.inf], '')
+    excluded_df = excluded_df.replace([np.nan, np.inf, -np.inf], '')
 
     cleaned_df.drop(columns=["IC_norm", "Email_norm", "Phone_norm", "FinalStatus"], errors="ignore", inplace=True)
     excluded_df.drop(columns=["IC_norm", "Email_norm", "Phone_norm"], errors="ignore", inplace=True)
