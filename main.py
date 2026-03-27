@@ -91,7 +91,7 @@ def get_or_create_ws(sh, title, rows=1000, cols=20):
 # ----------------------------
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html")
 
 @app.get("/auto-data-cleaner", response_class=HTMLResponse)
 def ui(request: Request):
